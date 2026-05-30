@@ -19,6 +19,7 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/memory"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
@@ -73,6 +74,14 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		return nil, err
 	}
 
+	// Persistent memory (REASONIX.md / AGENTS.md hierarchy + auto-memory index)
+	// folds into the system prompt exactly here, once: it becomes part of the
+	// durable, cache-stable prefix every turn reuses, so memory costs nothing per
+	// turn. Mid-session changes never touch this prefix — they ride the
+	// controller's transient turn-injection and fold in on the next session.
+	mem := memory.Load(memory.Options{CWD: ".", UserDir: config.MemoryUserDir()})
+	sysPrompt = memory.Compose(sysPrompt, mem)
+
 	reg := tool.NewRegistry()
 	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: cfg.WriteRoots(), Network: cfg.Sandbox.Network}
 	if bashSpec.Mode == "enforce" && !sandbox.Available() {
@@ -114,6 +123,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// executor uses, so the model surfaces it like any other tool.
 	reg.Add(agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
 		entry.ContextWindow, cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate))
+
+	// The `remember` tool lets the model persist durable facts to the project's
+	// auto-memory store; the saved index loads into the prefix on the next session.
+	reg.Add(memory.NewRememberTool(mem.Store))
 
 	execSess := agent.NewSession(sysPrompt)
 	executor := agent.New(execProv, reg, execSess, agent.Options{
@@ -158,6 +171,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		SessionDir:   config.SessionDir(),
 		Host:         pluginHost,
 		Commands:     cmds,
+		Memory:       mem,
 		Cleanup:      cleanup,
 	}), nil
 }

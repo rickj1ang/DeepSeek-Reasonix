@@ -13,6 +13,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/command"
 	"reasonix/internal/event"
+	"reasonix/internal/memory"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
@@ -38,6 +40,7 @@ type Controller struct {
 	sessionDir   string
 	host         *plugin.Host
 	commands     []command.Command
+	mem          *memory.Set
 	cleanup      func()
 
 	// promptMu serialises approval prompts so at most one is outstanding at a
@@ -56,6 +59,13 @@ type Controller struct {
 	approvals   map[string]chan approvalReply
 	granted     map[string]bool
 	nextID      int
+
+	// pendingMemory holds memory notes added mid-session (via "#" quick-add or a
+	// memory edit) that haven't yet been folded into a turn. Compose drains it
+	// onto the next outgoing turn — never into the cache-stable system prefix — so
+	// a fresh memory takes effect this session without busting the prompt cache;
+	// it joins the prefix naturally on the next session.
+	pendingMemory []string
 }
 
 type approvalReply struct {
@@ -77,6 +87,7 @@ type Options struct {
 	SessionPath  string
 	Host         *plugin.Host
 	Commands     []command.Command
+	Memory       *memory.Set
 	Cleanup      func()
 }
 
@@ -97,6 +108,7 @@ func New(opts Options) *Controller {
 		sessionPath:  opts.SessionPath,
 		host:         opts.Host,
 		commands:     opts.Commands,
+		mem:          opts.Memory,
 		cleanup:      opts.Cleanup,
 		approvals:    map[string]chan approvalReply{},
 		granted:      map[string]bool{},
@@ -166,6 +178,20 @@ func (c *Controller) Submit(input string) {
 				c.notice("new session")
 			}
 		}()
+	case strings.HasPrefix(trimmed, "#"):
+		// "#<note>" quick-adds a memory line — same shortcut as the chat TUI, so
+		// the desktop and HTTP frontends (which route raw input through Submit)
+		// get it for free. It never starts a model turn.
+		note := strings.TrimSpace(trimmed[1:])
+		if note == "" {
+			c.notice("nothing to remember")
+			return
+		}
+		if path, err := c.QuickAdd(memory.ScopeProject, note); err != nil {
+			c.notice("memory: " + err.Error())
+		} else {
+			c.notice("remembered → " + path)
+		}
 	case strings.HasPrefix(trimmed, "/mcp__"):
 		c.runGuarded(func(ctx context.Context) error {
 			sent, found, err := c.MCPPrompt(ctx, trimmed)
@@ -364,6 +390,75 @@ func (c *Controller) Close() {
 	if c.cleanup != nil {
 		c.cleanup()
 	}
+}
+
+// --- memory ---
+//
+// c.mem is treated as an immutable snapshot guarded by c.mu: reads take the lock
+// and return the pointer; writes mutate disk then swap in a freshly discovered
+// snapshot. A turn-tail note is queued for each write so the change applies this
+// session without disturbing the cache-stable system prefix (it folds into the
+// prefix on the next session). All of these are no-ops returning "" when memory
+// is disabled.
+
+// QuickAdd appends a one-line note to the doc-memory file for scope (project
+// REASONIX.md by default) — the write side of "#<note>". Returns the file written.
+func (c *Controller) QuickAdd(scope memory.Scope, note string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mem == nil {
+		return "", nil
+	}
+	path := c.mem.DocPath(scope)
+	if path == "" {
+		return "", fmt.Errorf("no target file for memory scope %q", scope)
+	}
+	if err := memory.AppendDoc(path, note); err != nil {
+		return "", err
+	}
+	c.pendingMemory = append(c.pendingMemory, note)
+	c.refreshMemoryLocked()
+	return path, nil
+}
+
+// SaveDoc overwrites a recognized memory doc with body — the save side of the
+// desktop panel's in-place editor. Returns the file written.
+func (c *Controller) SaveDoc(path, body string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mem == nil {
+		return "", nil
+	}
+	written, err := c.mem.WriteDoc(path, body)
+	if err != nil {
+		return "", err
+	}
+	// Inject the new content once on the next turn: the cached prefix still holds
+	// the pre-edit version this session, so handing the model the current text
+	// avoids a stale-guidance gap until the next session re-folds it into the
+	// prefix. Trimmed to a single tail note (drained by Compose), not per-turn.
+	c.pendingMemory = append(c.pendingMemory,
+		"Memory file "+written+" was just edited. Its current contents:\n"+strings.TrimSpace(body))
+	c.refreshMemoryLocked()
+	return written, nil
+}
+
+// Memory returns the loaded memory snapshot (nil when memory is disabled), for
+// frontends that surface a memory panel or the /memory command. The returned
+// *Set is immutable — mutations go through QuickAdd / SaveDoc.
+func (c *Controller) Memory() *memory.Set {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mem
+}
+
+// refreshMemoryLocked re-discovers memory from disk so a later Memory() reflects
+// a just-applied write. Caller holds c.mu.
+func (c *Controller) refreshMemoryLocked() {
+	if c.mem == nil {
+		return
+	}
+	c.mem = memory.Load(memory.Options{CWD: c.mem.CWD, UserDir: c.mem.UserDir})
 }
 
 // --- approval bridge (agent gate → events) ---

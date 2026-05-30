@@ -1,0 +1,49 @@
+package memory
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// TestRememberToolSaves drives the tool the way the agent does — raw JSON args —
+// and verifies the fact lands in the store and the index.
+func TestRememberToolSaves(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	tl := NewRememberTool(store)
+
+	if tl.Name() != "remember" || tl.ReadOnly() {
+		t.Fatalf("unexpected tool identity: name=%q readonly=%v", tl.Name(), tl.ReadOnly())
+	}
+	// Schema must be valid JSON the provider can forward.
+	if !json.Valid(tl.Schema()) {
+		t.Fatal("remember schema is not valid JSON")
+	}
+
+	args := []byte(`{"name":"likes-go","description":"User likes Go","type":"user","body":"Default to Go for backend work."}`)
+	out, err := tl.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out, "Saved memory") {
+		t.Fatalf("unexpected tool output: %q", out)
+	}
+
+	list := store.List()
+	if len(list) != 1 || list[0].Name != "likes-go" || list[0].Type != TypeUser {
+		t.Fatalf("memory not saved correctly: %+v", list)
+	}
+}
+
+// TestRememberToolValidates rejects calls missing required fields rather than
+// writing an empty memory.
+func TestRememberToolValidates(t *testing.T) {
+	tl := NewRememberTool(Store{Dir: t.TempDir()})
+	if _, err := tl.Execute(context.Background(), []byte(`{"description":"d"}`)); err == nil {
+		t.Fatal("expected error when body is missing")
+	}
+	if _, err := tl.Execute(context.Background(), []byte(`{"body":"b"}`)); err == nil {
+		t.Fatal("expected error when description is missing")
+	}
+}

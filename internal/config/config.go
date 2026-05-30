@@ -249,6 +249,17 @@ func SessionDir() string {
 	return filepath.Join(dir, "reasonix", "sessions")
 }
 
+// MemoryUserDir returns the reasonix user config root (…/reasonix), under which
+// the user-global REASONIX.md and the per-project auto-memory store live. Empty
+// when the user config dir can't be resolved, which disables user-scoped memory.
+func MemoryUserDir() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "reasonix")
+}
+
 // CommandDirs returns the directories scanned for custom slash commands, lowest
 // priority first: the user dir (~/.config/reasonix/commands) then the project dir
 // (.reasonix/commands), so a project command overrides a user one with the same name.

@@ -16,9 +16,26 @@ const PlanModeMarker = "[Plan mode — read-only. Explore and propose; do not wr
 func (c *Controller) Compose(text string) string {
 	c.mu.Lock()
 	plan := c.planMode
+	notes := c.pendingMemory
+	c.pendingMemory = nil
 	c.mu.Unlock()
+
 	if plan {
-		return PlanModeMarker + "\n\n" + text
+		text = PlanModeMarker + "\n\n" + text
+	}
+
+	// Memory added mid-session rides the turn (never the cached system prefix),
+	// so it takes effect now without invalidating the prompt cache. It folds into
+	// the system prefix on the next session, where it costs nothing per turn.
+	if len(notes) > 0 {
+		var b strings.Builder
+		b.WriteString("<memory-update>\n")
+		b.WriteString("The following was just saved to project memory and applies from now on:\n")
+		for _, n := range notes {
+			b.WriteString("- " + n + "\n")
+		}
+		b.WriteString("</memory-update>\n\n")
+		text = b.String() + text
 	}
 	return text
 }
