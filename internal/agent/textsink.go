@@ -134,15 +134,25 @@ func (s *TextSink) closeTextStream(text, reasoning string) {
 	}
 }
 
-// usageLine prints the one-line token/cache summary — the key signal for the
-// cache-first design. Cache is reported as absolute "(N cached / M new)" so a
-// turn that adds a lot of fresh content doesn't read as "cache broke" the way a
-// falling percentage would; the cached prefix is still hitting, the denominator
-// just grew. Reasoning tokens (a subset of completion) show the chain-of-thought
-// cost. No-op when usage is unset.
+// usageLine writes the one-line token/cache summary; no-op when usage is unset.
 func (s *TextSink) usageLine(u *provider.Usage, p *provider.Pricing) {
+	if line := FormatUsageLine(u, p); line != "" {
+		fmt.Fprintln(s.out, line)
+		s.wroteAnything = true
+	}
+}
+
+// FormatUsageLine renders the per-turn token/cache summary — the key signal for
+// the cache-first design — as a single line (no trailing newline), or "" when
+// usage is unset or empty. Cache is reported as absolute "(N cached / M new)"
+// so a turn that adds a lot of fresh content doesn't read as "cache broke" the
+// way a falling percentage would; the cached prefix is still hitting, the
+// denominator just grew. Reasoning tokens (a subset of completion) show the
+// chain-of-thought cost. Shared by TextSink and the chat TUI so both frontends
+// render the line identically.
+func FormatUsageLine(u *provider.Usage, p *provider.Pricing) string {
 	if u == nil || u.TotalTokens == 0 {
-		return
+		return ""
 	}
 	cacheCol := ""
 	if u.PromptTokens > 0 {
@@ -163,9 +173,8 @@ func (s *TextSink) usageLine(u *provider.Usage, p *provider.Pricing) {
 	if p != nil {
 		cost = fmt.Sprintf(" · %s%.4f", p.Symbol(), p.Cost(u))
 	}
-	fmt.Fprintf(s.out, "  · %d tok · in %d%s · out %d%s%s\n",
+	return fmt.Sprintf("  · %d tok · in %d%s · out %d%s%s",
 		u.TotalTokens, u.PromptTokens, cacheCol, u.CompletionTokens, reasoning, cost)
-	s.wroteAnything = true
 }
 
 // dimText wraps s in the ANSI dim SGR sequence so reasoning streams visually

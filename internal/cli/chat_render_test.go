@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"charm.land/bubbles/v2/textarea"
+
+	"reasonix/internal/event"
 )
 
 // newTestChatTUI builds a chatTUI with just the pieces the streaming/commit and
@@ -30,13 +32,12 @@ func newTestChatTUI() chatTUI {
 func TestIngestSeparatesReasoningFromAnswer(t *testing.T) {
 	m := newTestChatTUI()
 
-	m.ingestChunk("\x1b[2m  ▎ thinking\x1b[0m\n") // reasoning header → live buffer
-	m.ingestChunk("\x1b[2m…reasoning…\x1b[0m")    // reasoning fragment → live buffer
+	m.ingestEvent(event.Event{Kind: event.Reasoning, Text: "…reasoning…"}) // header + fragment → live buffer
 	if len(*m.pendingCommit) != 0 {
 		t.Fatalf("reasoning should stay live until the answer begins, committed=%v", *m.pendingCommit)
 	}
 
-	m.ingestChunk("Hello answer") // answer begins → reasoning finalizes
+	m.ingestEvent(event.Event{Kind: event.Text, Text: "Hello answer"}) // answer begins → reasoning finalizes
 	if n := len(*m.pendingCommit); n != 1 || !strings.Contains((*m.pendingCommit)[0], "thinking") {
 		t.Fatalf("reasoning should commit when the answer begins, committed=%v", *m.pendingCommit)
 	}
@@ -57,8 +58,8 @@ func TestIngestSeparatesReasoningFromAnswer(t *testing.T) {
 // finalizes the answer streamed before it, preserving order in scrollback.
 func TestIngestEventFlushesAnswer(t *testing.T) {
 	m := newTestChatTUI()
-	m.ingestChunk("partial answer ")
-	m.ingestChunk("  -> read_file {\"path\":\"x\"}\n")
+	m.ingestEvent(event.Event{Kind: event.Text, Text: "partial answer "})
+	m.ingestEvent(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{Name: "read_file", Args: `{"path":"x"}`}})
 	if n := len(*m.pendingCommit); n != 2 {
 		t.Fatalf("answer then event line should be two commits, got %d: %v", n, *m.pendingCommit)
 	}

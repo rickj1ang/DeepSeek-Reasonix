@@ -17,6 +17,7 @@ import (
 
 	"reasonix/internal/agent"
 	"reasonix/internal/command"
+	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
@@ -76,7 +77,7 @@ type chatTUI struct {
 	pending       *strings.Builder
 	pendingCommit *[]string
 	renderer      *mdRenderer
-	textCh        chan string
+	eventCh       chan event.Event
 	doneCh        chan error
 	started       bool // banner + resumed history committed once
 
@@ -107,8 +108,8 @@ const (
 	tuiRunning
 )
 
-// agentTextMsg is one chunk of bytes the agent wrote to its output writer.
-type agentTextMsg string
+// agentEventMsg is one typed event from the agent's run loop.
+type agentEventMsg event.Event
 
 // agentDoneMsg signals that a single Run() call returned; err is non-nil when
 // the turn errored out (ctx cancellation surfaces as nil — not a user error).
@@ -145,9 +146,9 @@ type chatHooks struct {
 }
 
 // newChatTUI assembles the initial model. The agent runner has already been
-// constructed with a writer that feeds textCh; the TUI owns the channels and
-// the UI state. history pre-populates scrollback from a resumed session.
-func newChatTUI(runner agent.Runner, label, missing string, textCh chan string, doneCh chan error, termW int, hooks chatHooks, history []provider.Message, approvalCh chan approvalReq, host *plugin.Host, commands []command.Command) chatTUI {
+// constructed with an event sink that feeds eventCh; the TUI owns the channels
+// and the UI state. history pre-populates scrollback from a resumed session.
+func newChatTUI(runner agent.Runner, label, missing string, eventCh chan event.Event, doneCh chan error, termW int, hooks chatHooks, history []provider.Message, approvalCh chan approvalReq, host *plugin.Host, commands []command.Command) chatTUI {
 	ti := textarea.New()
 	ti.Prompt = ""
 	ti.CharLimit = 16384
@@ -177,7 +178,7 @@ func newChatTUI(runner agent.Runner, label, missing string, textCh chan string, 
 		pendingCommit:   &commitBuf,
 		turnAccumulator: &strings.Builder{},
 		renderer:        newMarkdownRenderer(termW),
-		textCh:          textCh,
+		eventCh:         eventCh,
 		doneCh:          doneCh,
 		hooks:           hooks,
 		history:         history,
@@ -203,7 +204,7 @@ const planModeMarker = "[Plan mode — read-only. Explore and propose; do not wr
 func (m chatTUI) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
-		waitForAgentText(m.textCh),
+		waitForAgentEvent(m.eventCh),
 		waitForAgentDone(m.doneCh),
 		waitForApproval(m.approvalCh),
 	)
@@ -348,9 +349,9 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, finalize(m, cmds)
 		}
 
-	case agentTextMsg:
-		m.ingestChunk(string(msg))
-		cmds = append(cmds, waitForAgentText(m.textCh))
+	case agentEventMsg:
+		m.ingestEvent(event.Event(msg))
+		cmds = append(cmds, waitForAgentEvent(m.eventCh))
 
 	case agentDoneMsg:
 		// Finalize whatever's still streaming, then settle the turn.
@@ -778,53 +779,70 @@ func (m *chatTUI) startTurn(sent, displayed string) tea.Cmd {
 	return tea.Batch(m.spinner.Tick, elapsedTick())
 }
 
-// ingestChunk routes one slice of agent-emitted bytes. Reasoning (dim) and
-// answer free-text accumulate in their live buffers; an event line (tool
-// dispatch, usage, warning, coordinator marker) first finalizes the reasoning
-// and answer streamed so far, then is itself committed — preserving order.
-func (m *chatTUI) ingestChunk(chunk string) {
-	if strings.HasPrefix(chunk, "\x1b[2m") {
-		m.reasoning.WriteString(chunk) // dim reasoning header / fragment
-		return
-	}
-	if isEventChunk(chunk) {
+// ingestEvent routes one typed event from the agent. Reasoning (dim) and answer
+// free-text accumulate in their live buffers; every other event first finalizes
+// the reasoning and answer streamed so far, then commits its own line —
+// preserving order. Switching on the event Kind replaces the old prefix-sniffing
+// of a flattened byte stream: the structure is now explicit.
+func (m *chatTUI) ingestEvent(e event.Event) {
+	switch e.Kind {
+	case event.Reasoning:
+		if m.reasoning.Len() == 0 {
+			m.reasoning.WriteString(dim("  ▎ thinking") + "\n")
+		}
+		m.reasoning.WriteString(dim(e.Text))
+
+	case event.Text:
+		m.commitReasoning() // reasoning ends as the answer begins
+		m.pending.WriteString(e.Text)
+		m.turnAccumulator.WriteString(e.Text)
+
+	case event.Message:
+		// The answer stream is complete — freeze reasoning + the markdown answer.
 		m.commitReasoning()
 		m.commitPending()
-		m.commitLine(strings.TrimRight(chunk, "\n"))
-		return
-	}
-	// Free text (the answer). Reasoning ends as the answer begins.
-	m.commitReasoning()
-	m.pending.WriteString(chunk)
-	m.turnAccumulator.WriteString(chunk)
-}
 
-// isEventChunk decides whether a chunk is an agent-generated event line (tool
-// dispatch, usage telemetry, warning, coordinator marker) rather than reasoning
-// (handled separately) or model free text. Prefix matching is reliable for the
-// agent-controlled prefixes; the coordinator's "[" marker needs the suffix
-// check so model output starting with "[" stays in the answer buffer.
-func isEventChunk(chunk string) bool {
-	switch {
-	case strings.HasPrefix(chunk, "  · "):
-		return true // usage line, truncation / compaction notice
-	case strings.HasPrefix(chunk, "  -> "):
-		return true // tool dispatch
-	case strings.HasPrefix(chunk, "  ! "):
-		return true // finish_reason warning
-	case strings.HasPrefix(chunk, "["):
-		end := strings.IndexByte(chunk, '\n')
-		if end < 0 {
-			end = len(chunk)
+	case event.ToolDispatch:
+		m.finalizeStreamed()
+		m.commitLine(fmt.Sprintf("  -> %s %s", e.Tool.Name, compactArgs(e.Tool.Args)))
+
+	case event.ToolResult:
+		// A successful result is silent (it only feeds the model); a blocked call
+		// surfaces a "⊘ name <reason>" line.
+		if e.Tool.Err != "" {
+			m.finalizeStreamed()
+			m.commitLine(fmt.Sprintf("  ⊘ %s %s", e.Tool.Name, e.Tool.Err))
 		}
-		head := chunk[:end]
-		return strings.Contains(head, " · planning]") || strings.Contains(head, " · executing]")
+
+	case event.Usage:
+		if line := agent.FormatUsageLine(e.Usage, e.Pricing); line != "" {
+			m.finalizeStreamed()
+			m.commitLine(line)
+		}
+
+	case event.Notice:
+		glyph := "·"
+		if e.Level == event.LevelWarn {
+			glyph = "!"
+		}
+		m.finalizeStreamed()
+		m.commitLine(fmt.Sprintf("  %s %s", glyph, e.Text))
+
+	case event.Phase:
+		m.finalizeStreamed()
+		m.commitLine(fmt.Sprintf("[%s]", e.Text))
 	}
-	return false
 }
 
-func waitForAgentText(ch chan string) tea.Cmd {
-	return func() tea.Msg { return agentTextMsg(<-ch) }
+// finalizeStreamed freezes any in-progress reasoning + answer into scrollback so
+// a following event line lands after them, preserving chronological order.
+func (m *chatTUI) finalizeStreamed() {
+	m.commitReasoning()
+	m.commitPending()
+}
+
+func waitForAgentEvent(ch chan event.Event) tea.Cmd {
+	return func() tea.Msg { return agentEventMsg(<-ch) }
 }
 
 func waitForAgentDone(ch chan error) tea.Cmd {
@@ -1070,16 +1088,24 @@ func renderUserBubble(line string, width int, planMode bool) string {
 	return bubble.Render(prefix + line)
 }
 
-// channelWriter is the io.Writer the agent writes to in TUI mode. Each Write
-// becomes an agentTextMsg. The channel is generously buffered so streaming
+// eventSink is the event.Sink the agent emits to in TUI mode. Each event
+// becomes an agentEventMsg. The channel is generously buffered so streaming
 // bursts don't back-pressure the agent goroutine.
-type channelWriter struct {
-	ch chan<- string
+type eventSink struct {
+	ch chan<- event.Event
 }
 
-func (w *channelWriter) Write(p []byte) (int, error) {
-	w.ch <- string(p)
-	return len(p), nil
+func (s *eventSink) Emit(e event.Event) { s.ch <- e }
+
+// compactArgs trims and caps a tool's raw JSON arguments for the dispatch line,
+// matching the agent's headless rendering so the chat timeline reads the same.
+func compactArgs(s string) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) > 120 {
+		return string(r[:120]) + "..."
+	}
+	return s
 }
 
 // approvalReq is a pending tool-call approval handed from the agent goroutine to

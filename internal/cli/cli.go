@@ -16,6 +16,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
+	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
@@ -148,13 +149,11 @@ func (rt *runtime) compactNow(ctx context.Context) error {
 // setup loads config, resolves the model(s), and builds a Runner: a single Agent,
 // or a two-model Coordinator when agent.planner_model is set. requireKey forces
 // the executor's API key to be present (used by run); chat passes false so the
-// session UI is reachable before a key is set. out is where the agent prints
-// streamed tokens / tool dispatch lines / usage — runAgent passes os.Stdout
-// for live output, the TUI passes a channel writer so events become tea.Msgs.
-// The markdown post-stream redraw uses ANSI cursor moves the TUI's viewport
-// can't interpret, so it's only enabled when out == os.Stdout on a TTY. The
-// cleanup stops plugin subprocesses.
-func setup(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, out io.Writer) (*runtime, error) {
+// session UI is reachable before a key is set. sink receives the agent's typed
+// event stream — runAgent passes a TextSink that renders to stdout, the TUI
+// passes an event-channel sink so events become tea.Msgs. The cleanup stops
+// plugin subprocesses.
+func setup(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink) (*runtime, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
@@ -222,25 +221,6 @@ func setup(ctx context.Context, modelName string, maxStepsOverride int, requireK
 	// executor uses, so the model surfaces it like any other tool.
 	reg.Add(agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
 		entry.ContextWindow, cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate))
-
-	// Markdown rendering replaces the streamed raw text with styled output
-	// once a turn's stream completes. The cursor-move escapes it emits would
-	// confuse the TUI's viewport, so only enable when out is os.Stdout on a
-	// TTY (the live `reasonix run` path); piped / captured / TUI cases get raw.
-	var renderer agent.Renderer
-	termW := 80
-	if out == os.Stdout && isTTY(os.Stdout) {
-		if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
-			termW = w
-		}
-		renderer = newMarkdownRenderer(termW)
-	}
-
-	// The agent emits a typed event stream; TextSink renders it to ANSI on out,
-	// reproducing the old inline output (markdown redraw included, when a
-	// renderer is set). The chat TUI feeds the same sink through a channel writer
-	// for now; a typed-event TUI sink lands in a later step.
-	sink := agent.NewTextSink(out, renderer, termW)
 
 	execSess := agent.NewSession(sysPrompt)
 	executor := agent.New(execProv, reg, execSess, agent.Options{
@@ -320,7 +300,18 @@ func runAgent(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	rt, err := setup(ctx, *model, *maxSteps, true, os.Stdout)
+	// Live run: render the agent's event stream to stdout. Markdown post-stream
+	// redraw (cursor moves) is enabled only on a TTY; piped / captured output
+	// keeps the raw stream.
+	var renderer agent.Renderer
+	termW := 80
+	if isTTY(os.Stdout) {
+		if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+			termW = w
+		}
+		renderer = newMarkdownRenderer(termW)
+	}
+	rt, err := setup(ctx, *model, *maxSteps, true, agent.NewTextSink(os.Stdout, renderer, termW))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 1
@@ -373,14 +364,14 @@ func chatREPL(args []string) int {
 
 	ctx := context.Background()
 
-	// Plumb agent output through a channel so it can become tea.Msgs inside
-	// the TUI's update loop. Buffered generously: streaming bursts (tool
-	// results, long answers) shouldn't backpressure the agent goroutine.
-	textCh := make(chan string, 1024)
+	// Plumb the agent's typed event stream through a channel so each event can
+	// become a tea.Msg inside the TUI's update loop. Buffered generously:
+	// streaming bursts (tool results, long answers) shouldn't backpressure the
+	// agent goroutine.
+	eventCh := make(chan event.Event, 1024)
 	doneCh := make(chan error, 1)
-	chanOut := &channelWriter{ch: textCh}
 
-	rt, err := setup(ctx, *model, *maxSteps, false, chanOut)
+	rt, err := setup(ctx, *model, *maxSteps, false, &eventSink{ch: eventCh})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 1
@@ -437,7 +428,7 @@ func chatREPL(args []string) int {
 	approver := newChannelApprover(approvalCh)
 	rt.executor.SetGate(permission.NewGate(rt.policy, approver))
 
-	m := newChatTUI(rt.runner, rt.label, missing, textCh, doneCh, termW, hooks, rt.replayHistory(), approvalCh, rt.host, rt.commands)
+	m := newChatTUI(rt.runner, rt.label, missing, eventCh, doneCh, termW, hooks, rt.replayHistory(), approvalCh, rt.host, rt.commands)
 	// No alt-screen: finalized transcript lines are committed to the terminal's
 	// normal buffer (via tea.Println) so native scrollback, the wheel, and copy
 	// all work — the bubbletea-managed region is just the bottom input/status.
