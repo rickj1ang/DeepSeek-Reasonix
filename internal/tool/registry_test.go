@@ -53,3 +53,39 @@ func TestRegistryRemovePrefix(t *testing.T) {
 		t.Errorf("RemovePrefix on absent prefix returned %d, want 0", got)
 	}
 }
+
+// TestRegistrySchemasSorted proves Schemas() emits tool definitions in
+// deterministic alphabetical order regardless of insertion order, so a logically
+// identical tool set produces a stable provider-facing request prefix (prompt
+// cache reuse). Names() must stay in insertion order — only the provider export
+// is sorted.
+func TestRegistrySchemasSorted(t *testing.T) {
+	r := NewRegistry()
+	// Add deliberately out of alphabetical order.
+	insertion := []string{"write", "bash", "read", "apply_patch"}
+	for _, n := range insertion {
+		r.Add(stubTool{n})
+	}
+
+	var got []string
+	for _, s := range r.Schemas() {
+		got = append(got, s.Name)
+	}
+	want := []string{"apply_patch", "bash", "read", "write"}
+	if len(got) != len(want) {
+		t.Fatalf("Schemas() names = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Schemas() names = %v, want %v (alphabetical)", got, want)
+		}
+	}
+
+	// The sort must not leak into Names(): display order stays insertion order.
+	gotNames := r.Names()
+	for i := range insertion {
+		if gotNames[i] != insertion[i] {
+			t.Fatalf("Names() = %v, want %v (insertion order)", gotNames, insertion)
+		}
+	}
+}
